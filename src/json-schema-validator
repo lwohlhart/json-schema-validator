@@ -1,0 +1,127 @@
+#!/usr/bin/env node
+
+const Validator = require('jsonschema').Validator;
+const fs = require('fs');
+const crypto = require('crypto');
+const { program } = require('commander');
+const https = require('https'); 
+const axios = require('axios');
+const { URL } = require('url');
+
+process.on('SIGINT', function() {
+    process.exit();
+});
+process.on('SIGTERM', function() {
+    process.exit();
+});
+
+program
+  .name('json-schema-validator')
+  .option('-s, --schema <string>', 'json-schema to validate against (file or uri)', 'validation.schema.json')
+  .option('-l, --list <string>', 'json file, list of uris to validate', 'validation_list.json')
+  .option('-c, --cache <string>', 'cache directory', 'cache')
+  .option('-t, --throttle <int>', 'throttle between http requests (ms)', 1000)
+  .option('-o, --out <string>', 'error log file', 'validation_errors.log');
+program.parse();
+
+const options = program.opts();
+
+const getJSONFileOrHttpResource = async(uri) => {    
+    try {
+        // attempt http load
+        const urlIsValid = new URL(uri);
+        const response = await axios.get(uri, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+        return response.data;
+    } catch (error) {
+        try {
+            // attempt file load
+            return JSON.parse(fs.readFileSync(uri).toString());
+        } catch (error) { }
+    }
+    return null;
+};
+
+const main = async (schema_uri, validation_list, cache_dir = 'cache',
+                    throttle=1000, validation_errors_file='validation_errors.log') => {
+    cache_dir = cache_dir.replace('/\/+$/', '');
+    const schema = await getJSONFileOrHttpResource(schema_uri);
+    if ((!schema) || (Object.prototype.toString.call(schema) !== '[object Object]')) {
+        console.error('Unable to fetch valid schema: ' + schema_uri);
+        return -1;
+    }
+    const json_uris_to_validate = await getJSONFileOrHttpResource(validation_list);
+    if (!json_uris_to_validate) {
+        console.error('Unable to fetch validation_list: ' + validation_list);
+        return -1;
+    } else if (Object.prototype.toString.call(json_uris_to_validate) !== '[object Array]') {
+        console.error('Error: validation_list is not a list ' + validation_list);
+        return -1;
+    }
+
+    console.info('Validating '+json_uris_to_validate.length+' json resources according to schema: '+schema_uri);
+
+    const error_log = [];
+
+    const v = new Validator();
+
+    if(!fs.existsSync(cache_dir)) {
+        fs.mkdirSync(cache_dir, { recursive: true });
+    }
+    const jsons_cache_file = cache_dir+'/jsons_cache.json'; 
+    let jsons_cache = {};
+    if (fs.existsSync(jsons_cache_file)) {
+        try {
+            jsons_cache = JSON.parse(fs.readFileSync(jsons_cache_file).toString());
+        } catch (error) {}
+    }
+
+    for (const json_uri of json_uris_to_validate) {
+        const cache_filename = crypto.createHash('sha256').update(json_uri).digest('hex') + ".json";
+        let material = null;
+        let material_from_cache = false;
+        if (fs.existsSync(cache_dir+'/'+cache_filename)){
+            material_from_cache = true;
+            material = JSON.parse(fs.readFileSync(cache_dir+'/'+cache_filename).toString()); 
+            
+            // maybe even continue - as it's validated already 
+            // console.info('Valid: (cached in ' + cache_filename + ') ' + json_uri);
+            // continue;
+        } else {
+            try {
+                if(throttle > 0) {
+                    new URL(json_uri); // check if is uri - throws error otherwise
+                    await new Promise(resolve => setTimeout(resolve, throttle)); // request throttle
+                }
+            } catch (error) { }
+            material = await getJSONFileOrHttpResource(json_uri); //  response.data;
+            if(!material) {
+                console.error('Error  (file/http): ' + json_uri);
+                error_log.push('Error  (file/http): ' + json_uri);
+                fs.writeFileSync(validation_errors_file, error_log.join('\n'));
+                continue;
+            }
+        }
+
+        const validation_result = v.validate(material, schema);
+        if(validation_result.errors.length) {
+            const error_line = 'Error (validation): ' + (json_uri +' : '+ validation_result.errors.map(e => { 
+                return e.property + '  ' + e.message;
+            }).join(' | '));
+            error_log.push(error_line);
+            console.error('Error (validation): ' + json_uri + ' check validation_errors.log for details');
+            fs.writeFileSync('validation_errors.log', error_log.join('\n'));
+        } else {
+            if(material_from_cache == false) {
+                console.info('Valid: ' + json_uri);
+                fs.writeFileSync(cache_dir+'/'+cache_filename, JSON.stringify(material, null, '\t'));
+            } else {
+                console.info('Valid (cached '+cache_filename+'): ' + json_uri);
+            }
+            jsons_cache[cache_filename] = json_uri;
+            fs.writeFileSync(jsons_cache_file, JSON.stringify(jsons_cache, null, '\t'));
+        }
+    }
+};
+
+// call main
+main(options.schema, options.list, options.cache, options.throttle, options.out);
