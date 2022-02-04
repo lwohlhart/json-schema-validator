@@ -76,5 +76,5 @@ The `validation_list.json` file is expected to be a plain array of strings decla
 
 You can also reference a schema that is hosted on the web. E.g.:
 ```bash
-docker run -ti -v $(pwd)/data:/data --schema http://domain.foo/bar.schema.json
+docker run -ti -v $(pwd)/examples_web:/data wohlhart/json-schema-validator --schema https://raw.githubusercontent.com/lwohlhart/json-schema-validator/master/examples_web/validation.schema.json
 ```
